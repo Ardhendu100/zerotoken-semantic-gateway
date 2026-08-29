@@ -10,6 +10,19 @@
 
 ---
 
+## 🎯 Key Capabilities
+
+* **⚡ Sub-15ms Latency on Hits:** Returns semantically matching responses instantly from local vector memory.
+* **🛡️ Smart TTL & Volatile Query Bypass:** Automatically bypasses cache evaluation for real-time keywords (`today`, `stock price`, `weather`, `latest news`).
+* **🏢 Multi-Tenant Isolation:** Tenant context separation enforced via `X-Tenant-ID` request headers.
+* **🔒 Privacy & Guardrails:** Normalizes input whitespace/casing and strips basic PII before vector lookup.
+* **📊 Adaptive Token Budgeting:** Per-tenant daily token limits returning `HTTP 429` on budget cap exhaustion.
+* **📈 Streamlit Observability Dashboard:** Real-time KPI tracking for Cache Hit Rate, Cost Saved ($), and Latency Boxplots.
+
+---
+
+## 🏗️ System Architecture
+
 ## 💡 System Architecture
 
 ```text
