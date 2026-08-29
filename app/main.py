@@ -2,7 +2,7 @@ import json
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
-from fastapi import FastAPI, Request, HTTPException, status, Query, BackgroundTasks
+from fastapi import FastAPI, Depends, Request, HTTPException, status, Query, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 
@@ -11,6 +11,7 @@ from app.vector_store import VectorCacheManager
 from app.normalizer import normalize_text
 from app.guardrails import is_volatile_query, BudgetGuardrailManager
 from app.db import init_db, log_metrics_async
+from app.auth import get_tenant_id_from_key  # 👈 Added Auth Dependency Import
 
 # Standard LLM Pricing per 1k tokens (Estimated GPT-4o class rate for savings calculation)
 COST_PER_PROMPT_TOKEN = 0.005 / 1000
@@ -56,7 +57,11 @@ async def health_check():
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, background_tasks: BackgroundTasks):
+async def chat_completions(
+    request: Request, 
+    background_tasks: BackgroundTasks,
+    tenant_id: str = Depends(get_tenant_id_from_key)  # 👈 Automatically validates API Key and extracts tenant_id
+):
     start_time = time.perf_counter()
     try:
         body = await request.json()
@@ -66,7 +71,6 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
             detail="Invalid JSON payload"
         )
 
-    tenant_id = request.headers.get("X-Tenant-ID", "default")
     is_stream = body.get("stream", False)
     client: httpx.AsyncClient = request.app.state.http_client
     vector_cache: VectorCacheManager = request.app.state.vector_cache
@@ -181,11 +185,11 @@ async def chat_completions(request: Request, background_tasks: BackgroundTasks):
 @app.delete("/v1/cache")
 async def invalidate_cache(
     request: Request,
-    tenant_id: Optional[str] = Query(default=None),
+    tenant_id: str = Depends(get_tenant_id_from_key),  # 👈 Authenticated tenant
     purge_all: bool = Query(default=False, alias="all")
 ):
     vector_cache: VectorCacheManager = request.app.state.vector_cache
     if not tenant_id and not purge_all:
         raise HTTPException(status_code=400, detail="Specify 'tenant_id' or 'all=true'.")
     vector_cache.delete_cache(tenant_id=tenant_id, purge_all=purge_all)
-    return {"status": "success", "message": "Cache invalidated."}
+    return {"status": "success", "message": f"Cache invalidated for tenant '{tenant_id}'."}

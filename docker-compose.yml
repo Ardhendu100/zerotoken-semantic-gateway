@@ -24,6 +24,9 @@ services:
     container_name: zerotoken-gateway
     ports:
       - "8000:8000"
+    volumes:
+      # Mount SQLite database file so tenant API keys and metrics persist on host & container
+      - ./zerotoken_metrics.db:/app/zerotoken_metrics.db
     environment:
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
@@ -43,6 +46,9 @@ services:
     command: ["uv", "run", "streamlit", "run", "app/dashboard.py", "--server.port=8501", "--server.address=0.0.0.0"]
     ports:
       - "8501:8501"
+    volumes:
+      # Mount SQLite database so dashboard reads live metrics updated by gateway
+      - ./zerotoken_metrics.db:/app/zerotoken_metrics.db
     env_file:
       - .env
     depends_on:
