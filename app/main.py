@@ -8,11 +8,13 @@ import httpx
 from app.config import settings
 from app.vector_store import VectorCacheManager
 from app.normalizer import normalize_text
+from app.guardrails import is_volatile_query, BudgetGuardrailManager
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.vector_cache = VectorCacheManager()
+    app.state.budget_manager = BudgetGuardrailManager(daily_token_limit=100000)
     app.state.http_client = httpx.AsyncClient(
         base_url=settings.UPSTREAM_BASE_URL,
         headers={"Authorization": f"Bearer {settings.UPSTREAM_API_KEY}"},
@@ -30,7 +32,6 @@ app = FastAPI(
 )
 
 
-# Security Headers Middleware
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
@@ -56,11 +57,30 @@ async def chat_completions(request: Request):
             detail="Invalid JSON payload"
         )
 
-    # Multi-tenant header extraction (defaults to 'default')
     tenant_id = request.headers.get("X-Tenant-ID", "default")
     is_stream = body.get("stream", False)
     client: httpx.AsyncClient = request.app.state.http_client
     vector_cache: VectorCacheManager = request.app.state.vector_cache
+    budget_manager: BudgetGuardrailManager = request.app.state.budget_manager
+
+    # 1. Budget Guardrail Enforcement
+    allowed, current_usage, max_limit = budget_manager.check_budget(tenant_id=tenant_id, estimated_tokens=100)
+    if not allowed:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={
+                "error": {
+                    "message": f"Daily token budget exceeded for tenant '{tenant_id}'. Used {current_usage}/{max_limit} tokens.",
+                    "type": "budget_exceeded",
+                    "code": 429
+                }
+            },
+            headers={
+                "X-Tenant-ID": tenant_id,
+                "X-RateLimit-Limit": str(max_limit),
+                "X-RateLimit-Remaining": "0"
+            }
+        )
 
     messages = body.get("messages", [])
     raw_user_prompt = ""
@@ -70,9 +90,10 @@ async def chat_completions(request: Request):
             break
 
     cleaned_prompt = normalize_text(raw_user_prompt) if raw_user_prompt else ""
+    volatile = is_volatile_query(cleaned_prompt) if cleaned_prompt else False
 
-    # 1. Check Semantic Cache with Tenant Isolation
-    if not is_stream and cleaned_prompt:
+    # 2. Check Semantic Cache (Skip if volatile or streaming)
+    if not is_stream and cleaned_prompt and not volatile:
         cached_result = vector_cache.search_similar(
             query_text=cleaned_prompt,
             similarity_threshold=0.85,
@@ -85,11 +106,12 @@ async def chat_completions(request: Request):
                 headers={
                     "X-Cache": "HIT",
                     "X-Cache-Score": str(round(cached_result["score"], 4)),
-                    "X-Tenant-ID": tenant_id
+                    "X-Tenant-ID": tenant_id,
+                    "X-Cache-TTL": "STATIC"
                 }
             )
 
-    # 2. Proxy to Upstream LLM Provider on Cache Miss
+    # 3. Proxy to Upstream LLM Provider on Cache Miss / Volatile Query
     try:
         if is_stream:
             req = client.build_request("POST", "/chat/completions", json=body)
@@ -110,23 +132,36 @@ async def chat_completions(request: Request):
             return StreamingResponse(
                 sse_generator(),
                 media_type="text/event-stream",
-                headers={"X-Cache": "MISS", "X-Tenant-ID": tenant_id}
+                headers={
+                    "X-Cache": "BYPASS" if volatile else "MISS",
+                    "X-Tenant-ID": tenant_id
+                }
             )
         else:
             response = await client.post("/chat/completions", json=body)
             resp_data = response.json()
 
-            if response.status_code == 200 and cleaned_prompt:
-                vector_cache.store_cache(
-                    prompt=cleaned_prompt,
-                    response=resp_data,
-                    tenant_id=tenant_id
-                )
+            if response.status_code == 200:
+                # Record token usage from response
+                usage_tokens = resp_data.get("usage", {}).get("total_tokens", 100)
+                budget_manager.record_usage(tenant_id=tenant_id, actual_tokens=usage_tokens)
 
+                # Store response in cache ONLY if query is non-volatile
+                if cleaned_prompt and not volatile:
+                    vector_cache.store_cache(
+                        prompt=cleaned_prompt,
+                        response=resp_data,
+                        tenant_id=tenant_id
+                    )
+
+            cache_header = "BYPASS" if volatile else "MISS"
             return JSONResponse(
                 status_code=response.status_code,
                 content=resp_data,
-                headers={"X-Cache": "MISS", "X-Tenant-ID": tenant_id}
+                headers={
+                    "X-Cache": cache_header,
+                    "X-Tenant-ID": tenant_id
+                }
             )
 
     except httpx.ConnectError:
@@ -146,7 +181,6 @@ async def chat_completions(request: Request):
         )
 
 
-# Admin Invalidation Endpoint
 @app.delete("/v1/cache")
 async def invalidate_cache(
     request: Request,
@@ -162,7 +196,6 @@ async def invalidate_cache(
         )
 
     res = vector_cache.delete_cache(tenant_id=tenant_id, purge_all=purge_all)
-    
     if purge_all:
         return {"status": "success", "message": "Entire semantic cache purged successfully."}
     return {"status": "success", "message": f"Cache invalidated for tenant '{tenant_id}'."}

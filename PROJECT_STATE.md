@@ -12,7 +12,7 @@
 - [x] **Step 4:** Integrate local embedding model pre-warming & Qdrant vector database
 - [x] **Step 5:** Build Text Normalization & Intent + Entity Extraction Parser (PII Scrubbing)
 - [x] **Step 6:** Implement Multi-Tenant isolation, Security headers, and Admin Invalidation Endpoint (`DELETE /v1/cache`)
-- [ ] **Step 7:** Add Smart TTL keyword invalidation & Adaptive Budget Guardrails
+- [x] **Step 7:** Add Smart TTL keyword invalidation & Adaptive Budget Guardrails
 - [ ] **Step 8:** Build SQLite metrics logging & Streamlit observability dashboard
 - [ ] **Step 9:** Build terminal benchmark script (`demo.py`) showing latency & cost drop
 - [ ] **Step 10:** Dockerize & write recruiter-ready GitHub README.md
