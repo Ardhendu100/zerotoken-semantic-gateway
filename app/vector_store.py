@@ -1,7 +1,14 @@
 import uuid
 from typing import Any, Dict, List, Optional
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 from sentence_transformers import SentenceTransformer
 
 
@@ -9,16 +16,13 @@ class VectorCacheManager:
     def __init__(self, collection_name: str = "semantic_cache"):
         self.collection_name = collection_name
 
-        # Load local CPU model (384-dimensional vectors)
         print("⚡ Pre-warming sentence-transformer model (all-MiniLM-L6-v2) on CPU...")
         self.model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 
-        # Initialize persistent disk storage instead of :memory:
         self.client = QdrantClient(path="./qdrant_data")
         self._init_collection()
 
     def _init_collection(self):
-        # Create collection if it doesn't exist
         collections = [c.name for c in self.client.get_collections().collections]
         if self.collection_name not in collections:
             self.client.create_collection(
@@ -28,32 +32,36 @@ class VectorCacheManager:
             print(f"✅ Qdrant collection '{self.collection_name}' initialized.")
 
     def get_embedding(self, text: str) -> List[float]:
-        """Generate 384-dim normalized vector for input text."""
         return self.model.encode(text, normalize_embeddings=True).tolist()
 
     def search_similar(
         self,
         query_text: str,
         similarity_threshold: float = 0.85,
-        tenant_id: Optional[str] = None,
+        tenant_id: str = "default",
     ) -> Optional[Dict[str, Any]]:
-        """Search vector cache for semantically matching prompts."""
         query_vector = self.get_embedding(query_text)
+
+        # Enforce tenant isolation directly at the Qdrant filter level
+        tenant_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="tenant_id",
+                    match=MatchValue(value=tenant_id)
+                )
+            ]
+        )
 
         search_result = self.client.query_points(
             collection_name=self.collection_name,
             query=query_vector,
+            query_filter=tenant_filter,
             limit=1,
         ).points
 
         if search_result and search_result[0].score >= similarity_threshold:
             hit = search_result[0]
             payload = hit.payload or {}
-
-            # Ensure tenant isolation if specified
-            if tenant_id and payload.get("tenant_id") != tenant_id:
-                return None
-
             return {
                 "score": hit.score,
                 "cached_response": payload.get("response"),
@@ -66,7 +74,6 @@ class VectorCacheManager:
     def store_cache(
         self, prompt: str, response: Dict[str, Any], tenant_id: str = "default"
     ):
-        """Store prompt vector and response payload in Qdrant."""
         vector = self.get_embedding(prompt)
         point_id = str(uuid.uuid4())
 
@@ -84,3 +91,26 @@ class VectorCacheManager:
                 )
             ],
         )
+
+    def delete_cache(self, tenant_id: Optional[str] = None, purge_all: bool = False) -> int:
+        """Invalidate cache entries for a specific tenant or purge all."""
+        if purge_all:
+            self.client.delete_collection(self.collection_name)
+            self._init_collection()
+            return -1  # Indicates full wipe
+
+        if tenant_id:
+            tenant_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="tenant_id",
+                        match=MatchValue(value=tenant_id)
+                    )
+                ]
+            )
+            self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=tenant_filter
+            )
+            return 1
+        return 0
