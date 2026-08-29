@@ -9,8 +9,8 @@
 - [x] **Step 1:** System setup (`uv` package manager verified)
 - [x] **Step 2:** Folder structure (`app/`) and virtualenv initialized (`uv venv`)
 - [x] **Step 3:** Setup `.env` config, install dependencies (`uv pip install`), and build baseline FastAPI proxy server (In Progress)
-- [ ] **Step 4:** Integrate local embedding model pre-warming & Qdrant vector database
-- [ ] **Step 5:** Build Text Normalization & Intent + Entity Extraction Parser (PII Scrubbing)
+- [x] **Step 4:** Integrate local embedding model pre-warming & Qdrant vector database
+- [x] **Step 5:** Build Text Normalization & Intent + Entity Extraction Parser (PII Scrubbing)
 - [ ] **Step 6:** Implement Multi-Tenant isolation, Security headers, and Admin Invalidation Endpoint (`DELETE /v1/cache`)
 - [ ] **Step 7:** Add Smart TTL keyword invalidation & Adaptive Budget Guardrails
 - [ ] **Step 8:** Build SQLite metrics logging & Streamlit observability dashboard

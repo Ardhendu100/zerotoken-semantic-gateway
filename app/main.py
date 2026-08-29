@@ -5,10 +5,15 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 
 from app.config import settings
+from app.vector_store import VectorCacheManager
+from app.normalizer import normalize_text
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Pre-warm local embedding model & initialize persistent Qdrant
+    app.state.vector_cache = VectorCacheManager()
+
     # Shared HTTPX client with connection pooling for low-latency proxying
     app.state.http_client = httpx.AsyncClient(
         base_url=settings.UPSTREAM_BASE_URL,
@@ -44,7 +49,37 @@ async def chat_completions(request: Request):
 
     is_stream = body.get("stream", False)
     client: httpx.AsyncClient = request.app.state.http_client
+    vector_cache: VectorCacheManager = request.app.state.vector_cache
 
+    # Extract user prompt for semantic cache check
+    messages = body.get("messages", [])
+    raw_user_prompt = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            raw_user_prompt = msg.get("content", "")
+            break
+
+    # Step 5: Scrub PII & normalize input text
+    cleaned_prompt = normalize_text(raw_user_prompt) if raw_user_prompt else ""
+
+    # 1. Check Semantic Cache (Non-streaming requests)
+    if not is_stream and cleaned_prompt:
+        cached_result = vector_cache.search_similar(
+            query_text=cleaned_prompt,
+            similarity_threshold=0.85,
+            tenant_id="default"
+        )
+        if cached_result:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=cached_result["cached_response"],
+                headers={
+                    "X-Cache": "HIT",
+                    "X-Cache-Score": str(round(cached_result["score"], 4))
+                }
+            )
+
+    # 2. Proxy to Upstream LLM Provider on Cache Miss
     try:
         if is_stream:
             req = client.build_request("POST", "/chat/completions", json=body)
@@ -64,13 +99,25 @@ async def chat_completions(request: Request):
 
             return StreamingResponse(
                 sse_generator(),
-                media_type="text/event-stream"
+                media_type="text/event-stream",
+                headers={"X-Cache": "MISS"}
             )
         else:
             response = await client.post("/chat/completions", json=body)
+            resp_data = response.json()
+
+            # Store successful responses in Qdrant Vector Cache using normalized prompt
+            if response.status_code == 200 and cleaned_prompt:
+                vector_cache.store_cache(
+                    prompt=cleaned_prompt,
+                    response=resp_data,
+                    tenant_id="default"
+                )
+
             return JSONResponse(
                 status_code=response.status_code,
-                content=response.json()
+                content=resp_data,
+                headers={"X-Cache": "MISS"}
             )
 
     except httpx.ConnectError:
