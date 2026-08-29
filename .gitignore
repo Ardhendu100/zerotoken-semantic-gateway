@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# qudrant database files
+qdrant_storage/
