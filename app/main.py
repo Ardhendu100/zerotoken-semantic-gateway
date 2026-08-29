@@ -1,7 +1,8 @@
 import json
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
-from fastapi import FastAPI, Request, HTTPException, status, Query
+from fastapi import FastAPI, Request, HTTPException, status, Query, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 
@@ -9,10 +10,17 @@ from app.config import settings
 from app.vector_store import VectorCacheManager
 from app.normalizer import normalize_text
 from app.guardrails import is_volatile_query, BudgetGuardrailManager
+from app.db import init_db, log_metrics_async
+
+# Standard LLM Pricing per 1k tokens (Estimated GPT-4o class rate for savings calculation)
+COST_PER_PROMPT_TOKEN = 0.005 / 1000
+COST_PER_COMPLETION_TOKEN = 0.015 / 1000
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize SQLite database
+    init_db()
     app.state.vector_cache = VectorCacheManager()
     app.state.budget_manager = BudgetGuardrailManager(daily_token_limit=100000)
     app.state.http_client = httpx.AsyncClient(
@@ -48,7 +56,8 @@ async def health_check():
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def chat_completions(request: Request, background_tasks: BackgroundTasks):
+    start_time = time.perf_counter()
     try:
         body = await request.json()
     except Exception:
@@ -75,11 +84,7 @@ async def chat_completions(request: Request):
                     "code": 429
                 }
             },
-            headers={
-                "X-Tenant-ID": tenant_id,
-                "X-RateLimit-Limit": str(max_limit),
-                "X-RateLimit-Remaining": "0"
-            }
+            headers={"X-Tenant-ID": tenant_id}
         )
 
     messages = body.get("messages", [])
@@ -92,7 +97,7 @@ async def chat_completions(request: Request):
     cleaned_prompt = normalize_text(raw_user_prompt) if raw_user_prompt else ""
     volatile = is_volatile_query(cleaned_prompt) if cleaned_prompt else False
 
-    # 2. Check Semantic Cache (Skip if volatile or streaming)
+    # 2. Check Semantic Cache
     if not is_stream and cleaned_prompt and not volatile:
         cached_result = vector_cache.search_similar(
             query_text=cleaned_prompt,
@@ -100,80 +105,72 @@ async def chat_completions(request: Request):
             tenant_id=tenant_id
         )
         if cached_result:
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            
+            # Estimate saved tokens and costs
+            est_prompt_tokens = len(cleaned_prompt.split()) * 2
+            est_comp_tokens = 150
+            cost_saved = (est_prompt_tokens * COST_PER_PROMPT_TOKEN) + (est_comp_tokens * COST_PER_COMPLETION_TOKEN)
+
+            # Log metrics asynchronously in background
+            background_tasks.add_task(
+                log_metrics_async,
+                tenant_id=tenant_id,
+                cache_status="HIT",
+                latency_ms=latency_ms,
+                similarity_score=cached_result["score"],
+                prompt_tokens=est_prompt_tokens,
+                completion_tokens=est_comp_tokens,
+                cost_saved_usd=cost_saved
+            )
+
             return JSONResponse(
                 status_code=status.HTTP_200_OK,
                 content=cached_result["cached_response"],
                 headers={
                     "X-Cache": "HIT",
                     "X-Cache-Score": str(round(cached_result["score"], 4)),
-                    "X-Tenant-ID": tenant_id,
-                    "X-Cache-TTL": "STATIC"
+                    "X-Tenant-ID": tenant_id
                 }
             )
 
-    # 3. Proxy to Upstream LLM Provider on Cache Miss / Volatile Query
+    # 3. Cache Miss / Volatile Query -> Upstream Proxy
     try:
-        if is_stream:
-            req = client.build_request("POST", "/chat/completions", json=body)
-            response = await client.send(req, stream=True)
+        response = await client.post("/chat/completions", json=body)
+        resp_data = response.json()
+        latency_ms = (time.perf_counter() - start_time) * 1000
 
-            if response.status_code != 200:
-                error_body = await response.aread()
-                return JSONResponse(
-                    status_code=response.status_code,
-                    content=json.loads(error_body.decode())
+        cache_status = "BYPASS" if volatile else "MISS"
+        usage = resp_data.get("usage", {})
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        comp_tokens = usage.get("completion_tokens", 0)
+
+        if response.status_code == 200:
+            budget_manager.record_usage(tenant_id=tenant_id, actual_tokens=prompt_tokens + comp_tokens)
+            if cleaned_prompt and not volatile:
+                vector_cache.store_cache(
+                    prompt=cleaned_prompt,
+                    response=resp_data,
+                    tenant_id=tenant_id
                 )
 
-            async def sse_generator():
-                async for chunk in response.aiter_bytes():
-                    yield chunk
-                await response.aclose()
-
-            return StreamingResponse(
-                sse_generator(),
-                media_type="text/event-stream",
-                headers={
-                    "X-Cache": "BYPASS" if volatile else "MISS",
-                    "X-Tenant-ID": tenant_id
-                }
-            )
-        else:
-            response = await client.post("/chat/completions", json=body)
-            resp_data = response.json()
-
-            if response.status_code == 200:
-                # Record token usage from response
-                usage_tokens = resp_data.get("usage", {}).get("total_tokens", 100)
-                budget_manager.record_usage(tenant_id=tenant_id, actual_tokens=usage_tokens)
-
-                # Store response in cache ONLY if query is non-volatile
-                if cleaned_prompt and not volatile:
-                    vector_cache.store_cache(
-                        prompt=cleaned_prompt,
-                        response=resp_data,
-                        tenant_id=tenant_id
-                    )
-
-            cache_header = "BYPASS" if volatile else "MISS"
-            return JSONResponse(
-                status_code=response.status_code,
-                content=resp_data,
-                headers={
-                    "X-Cache": cache_header,
-                    "X-Tenant-ID": tenant_id
-                }
-            )
-
-    except httpx.ConnectError:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Unable to connect to upstream LLM API provider."
+        background_tasks.add_task(
+            log_metrics_async,
+            tenant_id=tenant_id,
+            cache_status=cache_status,
+            latency_ms=latency_ms,
+            similarity_score=0.0,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=comp_tokens,
+            cost_saved_usd=0.0
         )
-    except httpx.TimeoutException:
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Upstream LLM API request timed out."
+
+        return JSONResponse(
+            status_code=response.status_code,
+            content=resp_data,
+            headers={"X-Cache": cache_status, "X-Tenant-ID": tenant_id}
         )
+
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -184,18 +181,11 @@ async def chat_completions(request: Request):
 @app.delete("/v1/cache")
 async def invalidate_cache(
     request: Request,
-    tenant_id: Optional[str] = Query(default=None, description="Tenant ID to purge"),
-    purge_all: bool = Query(default=False, alias="all", description="Set to true to clear all cache")
+    tenant_id: Optional[str] = Query(default=None),
+    purge_all: bool = Query(default=False, alias="all")
 ):
     vector_cache: VectorCacheManager = request.app.state.vector_cache
-
     if not tenant_id and not purge_all:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Specify either 'tenant_id' parameter or 'all=true' to invalidate cache."
-        )
-
-    res = vector_cache.delete_cache(tenant_id=tenant_id, purge_all=purge_all)
-    if purge_all:
-        return {"status": "success", "message": "Entire semantic cache purged successfully."}
-    return {"status": "success", "message": f"Cache invalidated for tenant '{tenant_id}'."}
+        raise HTTPException(status_code=400, detail="Specify 'tenant_id' or 'all=true'.")
+    vector_cache.delete_cache(tenant_id=tenant_id, purge_all=purge_all)
+    return {"status": "success", "message": "Cache invalidated."}

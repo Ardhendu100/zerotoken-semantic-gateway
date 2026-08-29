@@ -13,8 +13,8 @@
 - [x] **Step 5:** Build Text Normalization & Intent + Entity Extraction Parser (PII Scrubbing)
 - [x] **Step 6:** Implement Multi-Tenant isolation, Security headers, and Admin Invalidation Endpoint (`DELETE /v1/cache`)
 - [x] **Step 7:** Add Smart TTL keyword invalidation & Adaptive Budget Guardrails
-- [ ] **Step 8:** Build SQLite metrics logging & Streamlit observability dashboard
-- [ ] **Step 9:** Build terminal benchmark script (`demo.py`) showing latency & cost drop
+- [x] **Step 8:** Build SQLite metrics logging & Streamlit observability dashboard
+- [x] **Step 9:** Build terminal benchmark script (`demo.py`) showing latency & cost drop
 - [ ] **Step 10:** Dockerize & write recruiter-ready GitHub README.md
 
 ## 📂 Active File Tree
